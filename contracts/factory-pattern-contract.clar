@@ -9,6 +9,8 @@
 (define-constant ERR_DEPLOYMENT_FAILED (err u108))
 (define-constant ERR_VERSION_NOT_FOUND (err u109))
 (define-constant ERR_INVALID_VERSION (err u110))
+(define-constant ERR_INVALID_ROYALTY (err u111))
+(define-constant ERR_NO_EARNINGS (err u112))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var factory-enabled bool true)
@@ -16,6 +18,8 @@
 (define-data-var next-product-id uint u1)
 (define-data-var total-revenue uint u0)
 (define-data-var next-version-id uint u1)
+(define-data-var marketplace-fee-percentage uint u500)
+(define-data-var max-royalty-percentage uint u5000)
 
 (define-map product-templates
   { template-id: uint }
@@ -76,15 +80,35 @@
   }
 )
 
+(define-map template-royalties
+  { template-id: uint }
+  {
+    royalty-percentage: uint,
+    total-earnings: uint,
+    withdrawable-earnings: uint
+  }
+)
+
+(define-map creator-earnings
+  { creator: principal }
+  {
+    total-earned: uint,
+    total-withdrawn: uint,
+    pending-earnings: uint
+  }
+)
+
 (define-public (create-template (name (string-ascii 50)) 
                                (description (string-ascii 200))
                                (template-code (string-ascii 10000))
-                               (creation-fee uint))
+                               (creation-fee uint)
+                               (royalty-percentage uint))
   (let ((template-id (var-get next-product-id)))
     (asserts! (var-get factory-enabled) ERR_FACTORY_DISABLED)
     (asserts! (> (len name) u0) ERR_INVALID_PARAMETERS)
     (asserts! (> (len template-code) u0) ERR_INVALID_PARAMETERS)
     (asserts! (>= creation-fee u0) ERR_INVALID_PARAMETERS)
+    (asserts! (<= royalty-percentage (var-get max-royalty-percentage)) ERR_INVALID_ROYALTY)
     
     (map-set product-templates
       { template-id: template-id }
@@ -128,6 +152,24 @@
       }
     )
     
+    (map-set template-royalties
+      { template-id: template-id }
+      {
+        royalty-percentage: royalty-percentage,
+        total-earnings: u0,
+        withdrawable-earnings: u0
+      }
+    )
+    
+    (let ((current-earnings (default-to
+            { total-earned: u0, total-withdrawn: u0, pending-earnings: u0 }
+            (map-get? creator-earnings { creator: tx-sender }))))
+      (map-set creator-earnings
+        { creator: tx-sender }
+        current-earnings
+      )
+    )
+    
     (var-set next-product-id (+ template-id u1))
     (ok template-id)
   )
@@ -146,7 +188,7 @@
     (asserts! (get active template) ERR_INVALID_TEMPLATE)
     (asserts! (>= (stx-get-balance tx-sender) total-fee) ERR_INSUFFICIENT_FUNDS)
     
-    (try! (stx-transfer? total-fee tx-sender (var-get contract-owner)))
+    (try! (process-deployment-payment template-id total-fee))
     
     (map-set deployed-contracts
       { contract-id: contract-id }
@@ -320,7 +362,7 @@
     (asserts! (get active version-data) ERR_INVALID_VERSION)
     (asserts! (>= (stx-get-balance tx-sender) total-fee) ERR_INSUFFICIENT_FUNDS)
     
-    (try! (stx-transfer? total-fee tx-sender (var-get contract-owner)))
+    (try! (process-deployment-payment template-id total-fee))
     
     (map-set deployed-contracts
       { contract-id: contract-id }
@@ -403,6 +445,98 @@
   )
 )
 
+(define-private (process-deployment-payment (template-id uint) (total-fee uint))
+  (let ((template (unwrap! (map-get? product-templates { template-id: template-id }) ERR_PRODUCT_NOT_FOUND))
+        (royalty-info (unwrap! (map-get? template-royalties { template-id: template-id }) ERR_PRODUCT_NOT_FOUND))
+        (creator (get creator template))
+        (royalty-amount (/ (* total-fee (get royalty-percentage royalty-info)) u10000))
+        (marketplace-fee (/ (* total-fee (var-get marketplace-fee-percentage)) u10000))
+        (factory-amount (- total-fee (+ royalty-amount marketplace-fee)))
+        (current-creator-earnings (default-to
+          { total-earned: u0, total-withdrawn: u0, pending-earnings: u0 }
+          (map-get? creator-earnings { creator: creator }))))
+    
+    (try! (stx-transfer? factory-amount tx-sender (var-get contract-owner)))
+    (try! (stx-transfer? royalty-amount tx-sender creator))
+    (try! (stx-transfer? marketplace-fee tx-sender (as-contract tx-sender)))
+    
+    (map-set template-royalties
+      { template-id: template-id }
+      {
+        royalty-percentage: (get royalty-percentage royalty-info),
+        total-earnings: (+ (get total-earnings royalty-info) royalty-amount),
+        withdrawable-earnings: (+ (get withdrawable-earnings royalty-info) royalty-amount)
+      }
+    )
+    
+    (map-set creator-earnings
+      { creator: creator }
+      {
+        total-earned: (+ (get total-earned current-creator-earnings) royalty-amount),
+        total-withdrawn: (get total-withdrawn current-creator-earnings),
+        pending-earnings: (+ (get pending-earnings current-creator-earnings) royalty-amount)
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (set-template-royalty (template-id uint) (new-royalty-percentage uint))
+  (let ((template (unwrap! (map-get? product-templates { template-id: template-id }) ERR_PRODUCT_NOT_FOUND))
+        (royalty-info (unwrap! (map-get? template-royalties { template-id: template-id }) ERR_PRODUCT_NOT_FOUND)))
+    
+    (asserts! (is-eq tx-sender (get creator template)) ERR_UNAUTHORIZED)
+    (asserts! (<= new-royalty-percentage (var-get max-royalty-percentage)) ERR_INVALID_ROYALTY)
+    
+    (map-set template-royalties
+      { template-id: template-id }
+      (merge royalty-info { royalty-percentage: new-royalty-percentage })
+    )
+    
+    (ok new-royalty-percentage)
+  )
+)
+
+(define-public (withdraw-creator-earnings (amount uint))
+  (let ((current-earnings (unwrap! (map-get? creator-earnings { creator: tx-sender }) ERR_NO_EARNINGS)))
+    
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (<= amount (get pending-earnings current-earnings)) ERR_INSUFFICIENT_FUNDS)
+    
+    (try! (as-contract (stx-transfer? amount tx-sender tx-sender)))
+    
+    (map-set creator-earnings
+      { creator: tx-sender }
+      {
+        total-earned: (get total-earned current-earnings),
+        total-withdrawn: (+ (get total-withdrawn current-earnings) amount),
+        pending-earnings: (- (get pending-earnings current-earnings) amount)
+      }
+    )
+    
+    (ok amount)
+  )
+)
+
+(define-public (set-marketplace-fee (new-fee-percentage uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_UNAUTHORIZED)
+    (asserts! (<= new-fee-percentage u1000) ERR_INVALID_PARAMETERS)
+    (var-set marketplace-fee-percentage new-fee-percentage)
+    (ok new-fee-percentage)
+  )
+)
+
+(define-public (set-max-royalty (new-max-percentage uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_UNAUTHORIZED)
+    (asserts! (<= new-max-percentage u10000) ERR_INVALID_PARAMETERS)
+    (var-set max-royalty-percentage new-max-percentage)
+    (ok new-max-percentage)
+  )
+)
+
 (define-read-only (get-template (template-id uint))
   (map-get? product-templates { template-id: template-id })
 )
@@ -460,6 +594,45 @@
   (let ((version-info (map-get? template-version-info { template-id: template-id })))
     (match version-info
       info (map-get? template-versions { template-id: template-id, version: (get latest-version info) })
+      none
+    )
+  )
+)
+
+(define-read-only (get-template-royalty (template-id uint))
+  (map-get? template-royalties { template-id: template-id })
+)
+
+(define-read-only (get-creator-earnings (creator principal))
+  (map-get? creator-earnings { creator: creator })
+)
+
+(define-read-only (get-marketplace-info)
+  {
+    marketplace-fee-percentage: (var-get marketplace-fee-percentage),
+    max-royalty-percentage: (var-get max-royalty-percentage),
+    factory-owner: (var-get contract-owner)
+  }
+)
+
+(define-read-only (calculate-deployment-costs (template-id uint))
+  (let ((template (map-get? product-templates { template-id: template-id }))
+        (royalty-info (map-get? template-royalties { template-id: template-id })))
+    (match template
+      template-data (match royalty-info
+        royalty-data (let ((base-fee (get creation-fee template-data))
+                           (deploy-fee (var-get deployment-fee))
+                           (total-fee (+ base-fee deploy-fee))
+                           (royalty-amount (/ (* total-fee (get royalty-percentage royalty-data)) u10000))
+                           (marketplace-fee (/ (* total-fee (var-get marketplace-fee-percentage)) u10000))
+                           (factory-amount (- total-fee (+ royalty-amount marketplace-fee))))
+                       (some { 
+                         total-cost: total-fee,
+                         creator-royalty: royalty-amount,
+                         marketplace-fee: marketplace-fee,
+                         factory-revenue: factory-amount
+                       }))
+        none)
       none
     )
   )
