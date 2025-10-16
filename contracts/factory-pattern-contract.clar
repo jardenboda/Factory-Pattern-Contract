@@ -11,6 +11,9 @@
 (define-constant ERR_INVALID_VERSION (err u110))
 (define-constant ERR_INVALID_ROYALTY (err u111))
 (define-constant ERR_NO_EARNINGS (err u112))
+(define-constant ERR_INVALID_RATING (err u113))
+(define-constant ERR_ALREADY_RATED (err u114))
+(define-constant ERR_NOT_DEPLOYER (err u115))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var factory-enabled bool true)
@@ -98,6 +101,40 @@
   }
 )
 
+(define-map template-ratings
+  { template-id: uint }
+  {
+    total-ratings: uint,
+    sum-ratings: uint,
+    average-rating: uint,
+    five-star: uint,
+    four-star: uint,
+    three-star: uint,
+    two-star: uint,
+    one-star: uint
+  }
+)
+
+(define-map user-ratings
+  { template-id: uint, user: principal }
+  {
+    rating: uint,
+    review: (string-ascii 500),
+    deployment-id: uint,
+    rated-at: uint
+  }
+)
+
+(define-map creator-reputation
+  { creator: principal }
+  {
+    total-templates: uint,
+    total-deployments: uint,
+    average-rating: uint,
+    total-ratings: uint
+  }
+)
+
 (define-public (create-template (name (string-ascii 50)) 
                                (description (string-ascii 200))
                                (template-code (string-ascii 10000))
@@ -163,11 +200,32 @@
     
     (let ((current-earnings (default-to
             { total-earned: u0, total-withdrawn: u0, pending-earnings: u0 }
-            (map-get? creator-earnings { creator: tx-sender }))))
+            (map-get? creator-earnings { creator: tx-sender })))
+          (current-reputation (default-to
+            { total-templates: u0, total-deployments: u0, average-rating: u0, total-ratings: u0 }
+            (map-get? creator-reputation { creator: tx-sender }))))
       (map-set creator-earnings
         { creator: tx-sender }
         current-earnings
       )
+      (map-set creator-reputation
+        { creator: tx-sender }
+        (merge current-reputation { total-templates: (+ (get total-templates current-reputation) u1) })
+      )
+    )
+    
+    (map-set template-ratings
+      { template-id: template-id }
+      {
+        total-ratings: u0,
+        sum-ratings: u0,
+        average-rating: u0,
+        five-star: u0,
+        four-star: u0,
+        three-star: u0,
+        two-star: u0,
+        one-star: u0
+      }
     )
     
     (var-set next-product-id (+ template-id u1))
@@ -537,6 +595,137 @@
   )
 )
 
+(define-public (rate-template (template-id uint) 
+                             (contract-id uint) 
+                             (rating uint) 
+                             (review (string-ascii 500)))
+  (let ((template (unwrap! (map-get? product-templates { template-id: template-id }) ERR_PRODUCT_NOT_FOUND))
+        (deployment (unwrap! (map-get? deployed-contracts { contract-id: contract-id }) ERR_PRODUCT_NOT_FOUND))
+        (existing-rating (map-get? user-ratings { template-id: template-id, user: tx-sender }))
+        (current-ratings (default-to
+          { total-ratings: u0, sum-ratings: u0, average-rating: u0, five-star: u0, four-star: u0, three-star: u0, two-star: u0, one-star: u0 }
+          (map-get? template-ratings { template-id: template-id })))
+        (creator (get creator template))
+        (creator-rep (default-to
+          { total-templates: u0, total-deployments: u0, average-rating: u0, total-ratings: u0 }
+          (map-get? creator-reputation { creator: creator }))))
+    
+    (asserts! (is-eq (get deployer deployment) tx-sender) ERR_NOT_DEPLOYER)
+    (asserts! (is-eq (get template-id deployment) template-id) ERR_INVALID_PARAMETERS)
+    (asserts! (is-none existing-rating) ERR_ALREADY_RATED)
+    (asserts! (and (>= rating u1) (<= rating u5)) ERR_INVALID_RATING)
+    
+    (map-set user-ratings
+      { template-id: template-id, user: tx-sender }
+      {
+        rating: rating,
+        review: review,
+        deployment-id: contract-id,
+        rated-at: stacks-block-height
+      }
+    )
+    
+    (let ((new-total (+ (get total-ratings current-ratings) u1))
+          (new-sum (+ (get sum-ratings current-ratings) rating))
+          (new-five (if (is-eq rating u5) (+ (get five-star current-ratings) u1) (get five-star current-ratings)))
+          (new-four (if (is-eq rating u4) (+ (get four-star current-ratings) u1) (get four-star current-ratings)))
+          (new-three (if (is-eq rating u3) (+ (get three-star current-ratings) u1) (get three-star current-ratings)))
+          (new-two (if (is-eq rating u2) (+ (get two-star current-ratings) u1) (get two-star current-ratings)))
+          (new-one (if (is-eq rating u1) (+ (get one-star current-ratings) u1) (get one-star current-ratings)))
+          (new-average (/ (* new-sum u100) new-total)))
+      
+      (map-set template-ratings
+        { template-id: template-id }
+        {
+          total-ratings: new-total,
+          sum-ratings: new-sum,
+          average-rating: new-average,
+          five-star: new-five,
+          four-star: new-four,
+          three-star: new-three,
+          two-star: new-two,
+          one-star: new-one
+        }
+      )
+      
+      (let ((creator-new-total (+ (get total-ratings creator-rep) u1))
+            (creator-new-sum (+ (* (get average-rating creator-rep) (get total-ratings creator-rep)) rating))
+            (creator-new-average (if (> creator-new-total u0) (/ (* creator-new-sum u100) creator-new-total) u0)))
+        
+        (map-set creator-reputation
+          { creator: creator }
+          {
+            total-templates: (get total-templates creator-rep),
+            total-deployments: (get total-deployments creator-rep),
+            average-rating: creator-new-average,
+            total-ratings: creator-new-total
+          }
+        )
+      )
+      
+      (ok true)
+    )
+  )
+)
+
+(define-public (update-rating (template-id uint) (rating uint) (review (string-ascii 500)))
+  (let ((existing-rating (unwrap! (map-get? user-ratings { template-id: template-id, user: tx-sender }) ERR_PRODUCT_NOT_FOUND))
+        (template (unwrap! (map-get? product-templates { template-id: template-id }) ERR_PRODUCT_NOT_FOUND))
+        (current-ratings (unwrap! (map-get? template-ratings { template-id: template-id }) ERR_PRODUCT_NOT_FOUND))
+        (creator (get creator template))
+        (creator-rep (unwrap! (map-get? creator-reputation { creator: creator }) ERR_PRODUCT_NOT_FOUND))
+        (old-rating (get rating existing-rating)))
+    
+    (asserts! (and (>= rating u1) (<= rating u5)) ERR_INVALID_RATING)
+    
+    (map-set user-ratings
+      { template-id: template-id, user: tx-sender }
+      (merge existing-rating { rating: rating, review: review, rated-at: stacks-block-height })
+    )
+    
+    (let ((adjusted-sum (+ (- (get sum-ratings current-ratings) old-rating) rating))
+          (new-average (/ (* adjusted-sum u100) (get total-ratings current-ratings)))
+          (old-five (if (is-eq old-rating u5) (- (get five-star current-ratings) u1) (get five-star current-ratings)))
+          (old-four (if (is-eq old-rating u4) (- (get four-star current-ratings) u1) (get four-star current-ratings)))
+          (old-three (if (is-eq old-rating u3) (- (get three-star current-ratings) u1) (get three-star current-ratings)))
+          (old-two (if (is-eq old-rating u2) (- (get two-star current-ratings) u1) (get two-star current-ratings)))
+          (old-one (if (is-eq old-rating u1) (- (get one-star current-ratings) u1) (get one-star current-ratings)))
+          (new-five (if (is-eq rating u5) (+ old-five u1) old-five))
+          (new-four (if (is-eq rating u4) (+ old-four u1) old-four))
+          (new-three (if (is-eq rating u3) (+ old-three u1) old-three))
+          (new-two (if (is-eq rating u2) (+ old-two u1) old-two))
+          (new-one (if (is-eq rating u1) (+ old-one u1) old-one)))
+      
+      (map-set template-ratings
+        { template-id: template-id }
+        {
+          total-ratings: (get total-ratings current-ratings),
+          sum-ratings: adjusted-sum,
+          average-rating: new-average,
+          five-star: new-five,
+          four-star: new-four,
+          three-star: new-three,
+          two-star: new-two,
+          one-star: new-one
+        }
+      )
+      
+      (let ((creator-adjusted-sum (+ (- (* (get average-rating creator-rep) (get total-ratings creator-rep)) old-rating) rating))
+            (creator-new-average (if (> (get total-ratings creator-rep) u0) 
+                                    (/ (* creator-adjusted-sum u100) (get total-ratings creator-rep)) 
+                                    u0)))
+        
+        (map-set creator-reputation
+          { creator: creator }
+          (merge creator-rep { average-rating: creator-new-average })
+        )
+      )
+      
+      (ok true)
+    )
+  )
+)
+
 (define-read-only (get-template (template-id uint))
   (map-get? product-templates { template-id: template-id })
 )
@@ -632,8 +821,41 @@
                          marketplace-fee: marketplace-fee,
                          factory-revenue: factory-amount
                        }))
-        none)
-      none
-    )
+                       none)
+                       none
+                       )
+                       )
+)
+
+(define-read-only (get-template-rating (template-id uint))
+  (map-get? template-ratings { template-id: template-id })
+)
+
+(define-read-only (get-user-rating (template-id uint) (user principal))
+  (map-get? user-ratings { template-id: template-id, user: user })
+)
+
+(define-read-only (get-creator-reputation (creator principal))
+  (map-get? creator-reputation { creator: creator })
+)
+
+(define-read-only (get-template-rating-summary (template-id uint))
+  (match (map-get? template-ratings { template-id: template-id })
+    ratings (some {
+      average: (get average-rating ratings),
+      total: (get total-ratings ratings),
+      distribution: {
+        five-star: (get five-star ratings),
+        four-star: (get four-star ratings),
+        three-star: (get three-star ratings),
+        two-star: (get two-star ratings),
+        one-star: (get one-star ratings)
+      }
+    })
+    none
   )
+)
+
+(define-read-only (has-user-rated (template-id uint) (user principal))
+  (is-some (map-get? user-ratings { template-id: template-id, user: user }))
 )
