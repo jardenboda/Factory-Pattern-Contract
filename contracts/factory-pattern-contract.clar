@@ -14,6 +14,7 @@
 (define-constant ERR_INVALID_RATING (err u113))
 (define-constant ERR_ALREADY_RATED (err u114))
 (define-constant ERR_NOT_DEPLOYER (err u115))
+(define-constant ERR_ACCESS_DENIED (err u116))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var factory-enabled bool true)
@@ -135,6 +136,21 @@
   }
 )
 
+(define-map template-access-mode
+  { template-id: uint }
+  { mode: uint }
+)
+
+(define-map template-whitelist
+  { template-id: uint, user: principal }
+  { allowed: bool }
+)
+
+(define-map template-blacklist
+  { template-id: uint, user: principal }
+  { blocked: bool }
+)
+
 (define-public (create-template (name (string-ascii 50)) 
                                (description (string-ascii 200))
                                (template-code (string-ascii 10000))
@@ -245,6 +261,7 @@
     (asserts! (var-get factory-enabled) ERR_FACTORY_DISABLED)
     (asserts! (get active template) ERR_INVALID_TEMPLATE)
     (asserts! (>= (stx-get-balance tx-sender) total-fee) ERR_INSUFFICIENT_FUNDS)
+    (try! (verify-template-access template-id tx-sender))
     
     (try! (process-deployment-payment template-id total-fee))
     
@@ -419,6 +436,7 @@
     (asserts! (get active template) ERR_INVALID_TEMPLATE)
     (asserts! (get active version-data) ERR_INVALID_VERSION)
     (asserts! (>= (stx-get-balance tx-sender) total-fee) ERR_INSUFFICIENT_FUNDS)
+    (try! (verify-template-access template-id tx-sender))
     
     (try! (process-deployment-payment template-id total-fee))
     
@@ -537,6 +555,46 @@
     )
     
     (ok true)
+  )
+)
+
+(define-private (verify-template-access (template-id uint) (user principal))
+  (let ((mode-info (default-to { mode: u0 } (map-get? template-access-mode { template-id: template-id })))
+        (white-info (default-to { allowed: false } (map-get? template-whitelist { template-id: template-id, user: user })))
+        (black-info (default-to { blocked: false } (map-get? template-blacklist { template-id: template-id, user: user })))
+        (mode (get mode mode-info))
+        (is-allowed (get allowed white-info))
+        (is-blocked (get blocked black-info)))
+    (if (is-eq mode u0)
+        (if is-blocked ERR_ACCESS_DENIED (ok true))
+        (if (is-eq mode u1)
+            (if is-allowed (ok true) ERR_ACCESS_DENIED)
+            (if is-blocked ERR_ACCESS_DENIED (ok true))))
+  )
+)
+
+(define-public (set-template-access-mode (template-id uint) (mode uint))
+  (let ((template (unwrap! (map-get? product-templates { template-id: template-id }) ERR_PRODUCT_NOT_FOUND)))
+    (asserts! (is-eq tx-sender (get creator template)) ERR_UNAUTHORIZED)
+    (asserts! (or (is-eq mode u0) (or (is-eq mode u1) (is-eq mode u2))) ERR_INVALID_PARAMETERS)
+    (map-set template-access-mode { template-id: template-id } { mode: mode })
+    (ok mode)
+  )
+)
+
+(define-public (set-template-whitelist (template-id uint) (user principal) (allowed bool))
+  (let ((template (unwrap! (map-get? product-templates { template-id: template-id }) ERR_PRODUCT_NOT_FOUND)))
+    (asserts! (is-eq tx-sender (get creator template)) ERR_UNAUTHORIZED)
+    (map-set template-whitelist { template-id: template-id, user: user } { allowed: allowed })
+    (ok allowed)
+  )
+)
+
+(define-public (set-template-blacklist (template-id uint) (user principal) (blocked bool))
+  (let ((template (unwrap! (map-get? product-templates { template-id: template-id }) ERR_PRODUCT_NOT_FOUND)))
+    (asserts! (is-eq tx-sender (get creator template)) ERR_UNAUTHORIZED)
+    (map-set template-blacklist { template-id: template-id, user: user } { blocked: blocked })
+    (ok blocked)
   )
 )
 
