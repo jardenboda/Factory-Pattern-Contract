@@ -151,6 +151,11 @@
   { blocked: bool }
 )
 
+(define-map template-credits
+  { template-id: uint, user: principal }
+  { credits: uint }
+)
+
 (define-public (create-template (name (string-ascii 50)) 
                                (description (string-ascii 200))
                                (template-code (string-ascii 10000))
@@ -596,6 +601,109 @@
     (map-set template-blacklist { template-id: template-id, user: user } { blocked: blocked })
     (ok blocked)
   )
+)
+
+(define-public (purchase-deployment-credits (template-id uint) (quantity uint))
+  (let ((template (unwrap! (map-get? product-templates { template-id: template-id }) ERR_PRODUCT_NOT_FOUND))
+        (unit-fee (+ (get creation-fee template) (var-get deployment-fee)))
+        (total-fee (* unit-fee quantity))
+        (current-stats (default-to
+          { total-deployments: u0, total-revenue: u0, last-deployment-block: u0 }
+          (map-get? template-statistics { template-id: template-id }))
+        )
+        (current-credits (default-to
+          { credits: u0 }
+          (map-get? template-credits { template-id: template-id, user: tx-sender }))
+        ))
+    (asserts! (var-get factory-enabled) ERR_FACTORY_DISABLED)
+    (asserts! (get active template) ERR_INVALID_TEMPLATE)
+    (asserts! (> quantity u0) ERR_INVALID_AMOUNT)
+    (asserts! (>= (stx-get-balance tx-sender) total-fee) ERR_INSUFFICIENT_FUNDS)
+    (try! (process-deployment-payment template-id total-fee))
+    (map-set template-credits
+      { template-id: template-id, user: tx-sender }
+      { credits: (+ (get credits current-credits) quantity) }
+    )
+    (map-set template-statistics
+      { template-id: template-id }
+      {
+        total-deployments: (get total-deployments current-stats),
+        total-revenue: (+ (get total-revenue current-stats) (* (get creation-fee template) quantity)),
+        last-deployment-block: stacks-block-height
+      }
+    )
+    (var-set total-revenue (+ (var-get total-revenue) total-fee))
+    (ok quantity)
+  )
+)
+
+(define-public (transfer-deployment-credits (template-id uint) (to principal) (quantity uint))
+  (let ((from-credits (unwrap! (map-get? template-credits { template-id: template-id, user: tx-sender }) ERR_INVALID_AMOUNT))
+        (to-credits (default-to { credits: u0 } (map-get? template-credits { template-id: template-id, user: to }))))
+    (asserts! (> quantity u0) ERR_INVALID_AMOUNT)
+    (asserts! (>= (get credits from-credits) quantity) ERR_INSUFFICIENT_FUNDS)
+    (map-set template-credits { template-id: template-id, user: tx-sender } { credits: (- (get credits from-credits) quantity) })
+    (map-set template-credits { template-id: template-id, user: to } { credits: (+ (get credits to-credits) quantity) })
+    (ok quantity)
+  )
+)
+
+(define-public (deploy-contract-with-credit (template-id uint)
+                                           (initialization-data (string-ascii 500)))
+  (let ((template (unwrap! (map-get? product-templates { template-id: template-id }) ERR_PRODUCT_NOT_FOUND))
+        (credits-info (unwrap! (map-get? template-credits { template-id: template-id, user: tx-sender }) ERR_INSUFFICIENT_FUNDS))
+        (contract-id (var-get next-product-id))
+        (current-stats (default-to
+          { total-deployments: u0, total-revenue: u0, last-deployment-block: u0 }
+          (map-get? template-statistics { template-id: template-id }))))
+    (asserts! (var-get factory-enabled) ERR_FACTORY_DISABLED)
+    (asserts! (get active template) ERR_INVALID_TEMPLATE)
+    (try! (verify-template-access template-id tx-sender))
+    (asserts! (> (get credits credits-info) u0) ERR_INSUFFICIENT_FUNDS)
+    (map-set template-credits
+      { template-id: template-id, user: tx-sender }
+      { credits: (- (get credits credits-info) u1) }
+    )
+    (map-set deployed-contracts
+      { contract-id: contract-id }
+      {
+        template-id: template-id,
+        deployer: tx-sender,
+        contract-address: tx-sender,
+        deployment-block: stacks-block-height,
+        initialization-data: initialization-data,
+        active: true
+      }
+    )
+    (map-set product-templates
+      { template-id: template-id }
+      (merge template { deployments: (+ (get deployments template) u1) })
+    )
+    (map-set template-statistics
+      { template-id: template-id }
+      {
+        total-deployments: (+ (get total-deployments current-stats) u1),
+        total-revenue: (get total-revenue current-stats),
+        last-deployment-block: stacks-block-height
+      }
+    )
+    (let ((current-user-deployments (default-to
+            { contract-ids: (list) }
+            (map-get? user-deployments { user: tx-sender, template-id: template-id }))))
+      (map-set user-deployments
+        { user: tx-sender, template-id: template-id }
+        { contract-ids: (unwrap! (as-max-len? 
+                                  (append (get contract-ids current-user-deployments) contract-id) 
+                                  u100) ERR_INVALID_PARAMETERS) }
+      )
+    )
+    (var-set next-product-id (+ contract-id u1))
+    (ok contract-id)
+  )
+)
+
+(define-read-only (get-user-credits (template-id uint) (user principal))
+  (map-get? template-credits { template-id: template-id, user: user })
 )
 
 (define-public (set-template-royalty (template-id uint) (new-royalty-percentage uint))
